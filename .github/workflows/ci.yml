@@ -1,0 +1,65 @@
+name: CI Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Unit & Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: webhook
+          POSTGRES_PASSWORD: webhook
+          POSTGRES_DB: webhook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U webhook -d webhook"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Apply Database Migrations
+        env:
+          PGPASSWORD: webhook
+        run: |
+          psql -h localhost -U webhook -d webhook -f migrations/001_init.sql
+          psql -h localhost -U webhook -d webhook -f migrations/002_unique_event_id.sql
+
+      - name: Run Go Tests with Race Detector
+        env:
+          DATABASE_URL: "postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable"
+          REDIS_ADDR: "localhost:6379"
+        run: |
+          go test -v -race ./...
