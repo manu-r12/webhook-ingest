@@ -72,27 +72,37 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
-func (s *Store) InsertEvent(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+// InsertEvent stores the raw delivery. It returns true if inserted, or false if event_id already exists.
+func (s *Store) InsertEvent(ctx context.Context, e Event) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
-		 VALUES ($1, $2, $3, $4)`,
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // UpsertCall creates or refreshes the call record for this event.
-func (s *Store) UpsertCall(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+// It returns isNew = true if a new call row was created, or false if an existing call was updated.
+func (s *Store) UpsertCall(ctx context.Context, e Event) (bool, error) {
+	var isNew bool
+	err := s.pool.QueryRow(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
 		     status        = EXCLUDED.status,
 		     duration_sec  = EXCLUDED.duration_sec,
 		     recording_url = EXCLUDED.recording_url,
-		     updated_at    = now()`,
-		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
-	return err
+		     updated_at    = now()
+		 RETURNING (xmax = 0) AS is_new`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL).Scan(&isNew)
+	if err != nil {
+		return false, err
+	}
+	return isNew, nil
 }
 
 // MarkRecordingProcessed flags the call's recording as handled.
