@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -138,4 +139,28 @@ func TestMultipleEventsForSameCallDoesNotDoubleCount(t *testing.T) {
 			got.CallCount, got.TotalDurationSec)
 	}
 }
+
+func TestRecordingProcessedInBackground(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// Give the background recording processing time to complete (recordingWork = 50ms)
+	time.Sleep(100 * time.Millisecond)
+
+	var processed bool
+	row := st.Pool().QueryRow(ctx, `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan call: %v", err)
+	}
+	if !processed {
+		t.Fatalf("expected recording_processed to be true, got false")
+	}
+}
+
 
