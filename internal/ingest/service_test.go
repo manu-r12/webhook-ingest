@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -82,3 +83,59 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
 	}
 }
+
+func TestConcurrentDuplicateIngestDoesNotDoubleCount(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp := post(t, srv.URL+"/webhooks/calls", body)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got status %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("account_stats: got CallCount=%d TotalDurationSec=%d, want CallCount=1 TotalDurationSec=143",
+			got.CallCount, got.TotalDurationSec)
+	}
+}
+
+func TestMultipleEventsForSameCallDoesNotDoubleCount(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID1, callID, accountID := testutil.IDs(t, st)
+	eventID2 := eventID1 + "_update"
+	ctx := context.Background()
+
+	body1 := eventJSON(eventID1, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body1); resp.StatusCode != http.StatusOK {
+		t.Fatalf("event 1: got %d, want 200", resp.StatusCode)
+	}
+
+	body2 := eventJSON(eventID2, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body2); resp.StatusCode != http.StatusOK {
+		t.Fatalf("event 2: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("account_stats after 2 events for same call: got CallCount=%d TotalDurationSec=%d, want CallCount=1 TotalDurationSec=143",
+			got.CallCount, got.TotalDurationSec)
+	}
+}
+
