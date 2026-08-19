@@ -43,8 +43,51 @@ failures are visible in the logs.
 ---
 
 ### 3. In-flight tasks lost on deployment/shutdown
-* **What was broken:** Background recording tasks ran in detached, unmanaged goroutines (`go func()`). During deployment shutdowns, `srv.Shutdown()` waited for active HTTP handlers but did not wait for background tasks. `main()` exited immediately and closed PostgreSQL pools (`st.Close()`), killing in-flight tasks mid-flight.
-* **How it was fixed:** Tracked background tasks using a `sync.WaitGroup` in `ingest.Service` and exposed `svc.Close()` (`s.wg.Wait()`), calling it during graceful shutdown in `main.go` before database pools close.
+Background recording goroutines were unmanaged - when the server received
+SIGTERM, `main()` shut down the HTTP server and immediately closed the
+Postgres pool. Any goroutine still sleeping through its 50ms of work
+woke up to a closed connection pool and failed silently.
+
+<img width="701" height="431" alt="Screenshot 2026-08-19 at 2 29 33 PM" src="https://github.com/user-attachments/assets/214b0a92-7d0d-44ba-9328-774b6b422070" />
+
+
+Fixed by adding a `sync.WaitGroup` to the service. Every goroutine calls
+`wg.Add(1)` on launch and `wg.Done()` when it finishes. `svc.Close()`
+calls `wg.Wait()` which blocks until every in-flight goroutine completes.
+In `main.go`, `svc.Close()` is called before `st.Close()` - so the pool
+stays open until all work is done.
+
+<img width="732" height="427" alt="Screenshot 2026-08-19 at 2 30 53 PM" src="https://github.com/user-attachments/assets/707b0ed8-8ff2-4ac1-a300-3fda3a63e3dd" />
+
+### 4. Stats return zero after service restart
+The `GET /accounts/{account_id}/stats` endpoint read exclusively from the in-memory cache `stats.Cache`. On server restarts, the cache started completely empty and returned `0` without ever querying PostgreSQL on a cache miss.
+
+Fixed by updating `svc.Stats()` to query PostgreSQL `store.AccountStats` on a cold cache miss and populate `stats.Cache` via `c.Set()`.
+
+<img width="764" height="454" alt="Screenshot 2026-08-19 at 6 58 57 PM" src="https://github.com/user-attachments/assets/998da18d-8f7d-42aa-809e-fe1e08da14bd" />
+
+### 5. Cache data race
+`Cache.Record()` was writing to a shared map without holding the write
+lock. `Cache.Get()` had the lock but `Record()` didn't. Under concurrent
+requests this would corrupt the counts or crash. Fixed by adding
+`c.mu.Lock()` to `Record()`.
+
+## Why Postgres UNIQUE over alternatives?
+
+- **App-level check (`EventExists` before insert):** Vulnerable to TOCTOU race conditions under concurrent requests.
+- **Redis lock (`SETNX`):** Fast, but if Redis restarts or evicts keys under memory pressure, duplicates slip through to the DB.
+- **Postgres UNIQUE index + `ON CONFLICT DO NOTHING` (Chosen):** 100% atomic ACID deduplication at the storage layer with zero race conditions or extra infrastructure dependencies.
+
+---
+
+## Scaling to 10,000 webhooks/sec
+
+To handle 10,000 req/sec without choking PostgreSQL connection pools:
+
+1. **Edge Ingestion:** Use Redis `SETNX event_id` at the HTTP layer for fast sub-5ms deduplication checks.
+2. **Buffer Queue:** Push valid events to a message queue (**Kafka / SQS**) and return `202 Accepted` immediately.
+3. **Batch DB Consumers:** Background workers process Kafka events in bulk batches (`COPY` / bulk upsert) to minimize DB lock contention.
+4. **Redis Stats Caching:** Maintain running stats in Redis (`HINCRBY`) with write-behind background sync to PostgreSQL.
 
 ## Tracked issues and pull requests
 
@@ -58,3 +101,8 @@ I filed a GitHub issue for each bug before fixing it, then opened a PR per fix s
 | [#6 Stats return zero after restart](https://github.com/manu-r12/webhook-ingest/issues/6) | [#PR](link) | Postgres fallback on cache miss |
 
 ---
+
+## Additional Quality Enhancements
+
+- **Automated CI/CD Pipeline:** Added GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) to automatically spin up PostgreSQL 16 & Redis 7 service containers and execute `go test -v -race ./...` on every push and PR.
+- **End-to-End Simulation Runner:** Built a high-concurrency simulation runner ([`cmd/simulate/main.go`](cmd/simulate/main.go)) that stress-tests 150 concurrent webhooks (50 calls × 3 redeliveries/updates) across 4 live verification phases.
