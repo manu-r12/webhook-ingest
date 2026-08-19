@@ -48,3 +48,14 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	s.CallCount++
 	s.TotalDurationSec += int64(durationSec)
 }
+
+// Set populates or overwrites the cached totals for an account.
+func (c *Cache) Set(accountID string, st AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m[accountID] = &AccountStats{
+		CallCount:        st.CallCount,
+		TotalDurationSec: st.TotalDurationSec,
+	}
+}

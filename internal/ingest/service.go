@@ -36,9 +36,25 @@ func (s *Service) Close() {
 	s.wg.Wait()
 }
 
-// Stats returns the cached totals for an account.
+// Stats returns the cached totals for an account, falling back to Postgres on cache miss.
 func (s *Service) Stats(accountID string) stats.AccountStats {
-	return s.cache.Get(accountID)
+	st := s.cache.Get(accountID)
+	if st.CallCount > 0 || st.TotalDurationSec > 0 {
+		return st
+	}
+
+	// Cache miss or empty cache: query database fallback
+	dbStats, err := s.store.AccountStats(context.Background(), accountID)
+	if err != nil || (dbStats.CallCount == 0 && dbStats.TotalDurationSec == 0) {
+		return st
+	}
+
+	res := stats.AccountStats{
+		CallCount:        dbStats.CallCount,
+		TotalDurationSec: dbStats.TotalDurationSec,
+	}
+	s.cache.Set(accountID, res)
+	return res
 }
 
 // Ingest stores a delivery and kicks off processing. Processing runs
