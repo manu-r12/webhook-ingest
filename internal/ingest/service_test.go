@@ -3,12 +3,16 @@ package ingest_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/ingest"
+	"github.com/convin/webhook-ingest/internal/stats"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -162,5 +166,41 @@ func TestRecordingProcessedInBackground(t *testing.T) {
 		t.Fatalf("expected recording_processed to be true, got false")
 	}
 }
+
+func TestServiceCloseWaitsForInFlightRecordings(t *testing.T) {
+	st := testutil.NewStore(t)
+	c := stats.NewCache()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := ingest.New(st, c, nil, log)
+	ctx := context.Background()
+
+	eventID, callID, accountID := testutil.IDs(t, st)
+	evt := ingest.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  100,
+		RecordingURL: "https://recordings.example.com/a.wav",
+		OccurredAt:   time.Now(),
+	}
+
+	if err := svc.Ingest(ctx, evt); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	// Close() must block and wait for all in-flight recording processing tasks to drain before returning
+	svc.Close()
+
+	var processed bool
+	row := st.Pool().QueryRow(ctx, `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan call: %v", err)
+	}
+	if !processed {
+		t.Fatalf("expected recording_processed to be true after svc.Close(), got false")
+	}
+}
+
 
 
