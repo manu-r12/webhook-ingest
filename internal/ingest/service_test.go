@@ -202,5 +202,26 @@ func TestServiceCloseWaitsForInFlightRecordings(t *testing.T) {
 	}
 }
 
+func TestAccountStatsFallbackToDatabaseOnColdCache(t *testing.T) {
+	st := testutil.NewStore(t)
+	c := stats.NewCache()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := ingest.New(st, c, nil, log)
+	ctx := context.Background()
+
+	_, _, accountID := testutil.IDs(t, st)
+	if err := st.IncrementAccountStats(ctx, accountID, 300); err != nil {
+		t.Fatalf("IncrementAccountStats: %v", err)
+	}
+
+	// In-memory cache is empty. svc.Stats should query PostgreSQL database and return durable stats.
+	got := svc.Stats(accountID)
+	if got.CallCount != 1 || got.TotalDurationSec != 300 {
+		t.Fatalf("cold cache fallback: got CallCount=%d TotalDurationSec=%d, want CallCount=1 TotalDurationSec=300",
+			got.CallCount, got.TotalDurationSec)
+	}
+}
+
+
 
 
