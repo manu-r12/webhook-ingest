@@ -139,3 +139,62 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 	}
 	return st, nil
 }
+
+// IngestTx runs InsertEvent, UpsertCall, and IncrementAccountStats inside a
+// single transaction. Returns (false, nil) if the event is a duplicate.
+func (s *Store) IngestTx(ctx context.Context, e Event) (inserted bool, isNewCall bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// 1. Insert event — idempotent via UNIQUE constraint
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// duplicate — commit the no-op and return early
+		return false, false, tx.Commit(ctx)
+	}
+
+	// 2. Upsert call
+	err = tx.QueryRow(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()
+		 RETURNING (xmax = 0) AS is_new`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL).Scan(&isNewCall)
+	if err != nil {
+		return false, false, err
+	}
+
+	// 3. Increment stats only for brand-new calls
+	if isNewCall {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+			 VALUES ($1, 1, $2)
+			 ON CONFLICT (account_id) DO UPDATE SET
+			     call_count         = account_stats.call_count + 1,
+			     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+			e.AccountID, e.DurationSec)
+		if err != nil {
+			return false, false, err
+		}
+	}
+
+	return true, isNewCall, tx.Commit(ctx)
+}

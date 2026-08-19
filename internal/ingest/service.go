@@ -76,7 +76,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		Payload:      payload,
 	}
 
-	inserted, err := s.store.InsertEvent(ctx, rec)
+	inserted, isNewCall, err := s.store.IngestTx(ctx, rec)
 	if err != nil {
 		return err
 	}
@@ -85,15 +85,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		return nil
 	}
 
-	isNewCall, err := s.store.UpsertCall(ctx, rec)
-	if err != nil {
-		return err
-	}
-
 	if isNewCall {
-		if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-			return err
-		}
 		s.cache.Record(rec.AccountID, rec.DurationSec)
 	}
 
