@@ -13,6 +13,7 @@ import (
 
 	"github.com/convin/webhook-ingest/internal/ingest"
 	"github.com/convin/webhook-ingest/internal/stats"
+	"github.com/convin/webhook-ingest/internal/store"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -222,6 +223,58 @@ func TestAccountStatsFallbackToDatabaseOnColdCache(t *testing.T) {
 	}
 }
 
+func TestIngestTxIsAtomicOnDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
 
+	evt := store.Event{
+		EventID:     eventID,
+		CallID:      callID,
+		AccountID:   accountID,
+		Status:      "completed",
+		DurationSec: 120,
+		Payload:     []byte(`{}`),
+	}
 
+	// First ingest — should insert everything
+	inserted, isNewCall, err := s.IngestTx(ctx, evt)
+	if err != nil {
+		t.Fatalf("first IngestTx: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected inserted=true on first call")
+	}
+	if !isNewCall {
+		t.Fatal("expected isNewCall=true on first call")
+	}
 
+	// Second ingest — same event_id, must be a no-op
+	inserted, _, err = s.IngestTx(ctx, evt)
+	if err != nil {
+		t.Fatalf("second IngestTx: %v", err)
+	}
+	if inserted {
+		t.Fatal("expected inserted=false on duplicate")
+	}
+
+	// Stats must reflect exactly one call, not two
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 120 {
+		t.Fatalf("got CallCount=%d TotalDurationSec=%d, want CallCount=1 TotalDurationSec=120",
+			got.CallCount, got.TotalDurationSec)
+	}
+
+	// events table must have exactly one row
+	var n int
+	row := s.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("events table has %d rows for event_id, want 1", n)
+	}
+}
